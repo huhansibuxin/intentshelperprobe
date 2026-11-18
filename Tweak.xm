@@ -52,13 +52,16 @@
  * （沙盒守护进程视图与 SSH 不同，/var/tmp 曾踩坑）。 */
 #define IHP_DISABLE_FLAG "/rootfs/private/var/tmp/ih_probe.disabled"
 
-/* 候选目录：进程自有容器优先，再通用 tmp。无需 mkdir 父目录（都已存在）。
- * SSH 读取时统一加 /rootfs/private 头（进程视图里写的是无头 /var/...）。 */
+/* 候选目录：按「mobile 身份注入进程可写」排序，已实测 mobile 对 /var/tmp、
+ * /private/var/tmp、Documents 可写，对 /var/mobile/Library/Logs 不可写(属
+ * _analyticsusers)。注入进程写无头 /var/...，SSH 用 /rootfs/private 头读到
+ * 同一处 —— 由 SearchPartyQuiet.log(注入 searchpartyd)实测印证。
+ * /var/tmp 置首：CacheDeleteQuiet 实测的就是这个落点。 */
 static const char *IHP_LOG_DIRS[] = {
-    "/var/mobile/Library/Logs",
     "/var/tmp",
     "/private/var/tmp",
     "/var/mobile/Documents",
+    "/var/mobile/Library/Logs",
 };
 
 static int      g_logfd = -1;
