@@ -220,12 +220,12 @@ static void ihp_dump_thread(mach_port_t th, int tidx) {
     ihp_frame(0, pc);
     /* v1.1.0: 栈顶正好在 stat/getattrlist 等 wrapper 内 => x0 是路径指针。
      * 只有在 syscall 入口附近(x0 尚未被覆盖)才读，读出来直接打印。 */
-    const char *sc = ihp_path_syscall(pc);
-    if (sc) {
-        uint64_t x0 = (uint64_t)arm_thread_state64_get_x(st, 0);
+    const char *sysc = ihp_path_syscall(pc);
+    if (sysc) {
+        uint64_t x0 = (uint64_t)st.__x[0];
         char path[512];
         ihp_read_cstr(x0, path, sizeof(path));
-        if (path[0]) ihp_line("    >> %s(\"%s\")", sc, path);
+        if (path[0]) ihp_line("    >> %s(\"%s\")", sysc, path);
     }
     if (lr && lr != pc) ihp_frame(1, (uint64_t)ptrauth_strip((void *)(uintptr_t)lr, ptrauth_key_asia));
 
