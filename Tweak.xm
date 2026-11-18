@@ -45,6 +45,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <syslog.h>
 
 /* 每实例独立日志：intents_helper 是多实例 XPC，共写一个文件会交错不可读。
  * 落盘范式照抄已验证的 CacheDeleteQuiet/SearchPartyQuiet：ctor 里多候选
@@ -75,15 +76,39 @@ static int      g_open_errno = 0;
 #define IHP_FP_DEPTH      16
 #define IHP_FRAME_BYTES   16       /* arm64 frame record = {fp, lr} = 16B */
 
-/* ctor 调用：多候选取首个成功 fd（与 CacheDeleteQuiet open_log 同法） */
+/* ctor 调用：多候选取首个成功 fd（与 CacheDeleteQuiet open_log 同法）。
+ * v1.0.1: TMPDIR 提到首位 —— intents_helper 是沙盒 XPC，/var/tmp 被沙盒
+ * 重定向，只有 TMPDIR 是沙盒保证可写处。每个候选成败走 syslog（沙盒可用），
+ * 一次安装即可从 syslog 看清 ctor 是否执行、哪个路径成功。 */
 static void ihp_open_log(void) {
     char name[96];
     snprintf(name, sizeof(name), "ih_probe_%d.log", (int)getpid());
+    openlog("IHP", LOG_PID, LOG_SYSLOG);
+    syslog(LOG_NOTICE, "ctor pid=%d starting, TMPDIR=%s",
+           (int)getpid(), getenv("TMPDIR") ? getenv("TMPDIR") : "(null)");
+
+    /* 首位：TMPDIR（沙盒私有临时目录，唯一保证可写） */
+    const char *tmp = getenv("TMPDIR");
+    if (tmp && *tmp) {
+        char p[512];
+        int n = snprintf(p, sizeof(p), "%s/%s", tmp, name);
+        if (n > 0 && n < (int)sizeof(p)) {
+            int fd = open(p, O_WRONLY | O_APPEND | O_CREAT, 0644);
+            syslog(LOG_NOTICE, "cand TMPDIR %s => fd=%d errno=%d", p, fd, errno);
+            if (fd >= 0) {
+                g_logfd = fd;
+                strncpy(g_logpath, p, sizeof(g_logpath)-1);
+                return;
+            }
+        }
+    }
+    /* 其余候选 */
     for (size_t i = 0; i < sizeof(IHP_LOG_DIRS)/sizeof(IHP_LOG_DIRS[0]); i++) {
         char p[256];
         int n = snprintf(p, sizeof(p), "%s/%s", IHP_LOG_DIRS[i], name);
         if (n <= 0 || n >= (int)sizeof(p)) continue;
         int fd = open(p, O_WRONLY | O_APPEND | O_CREAT, 0644);
+        syslog(LOG_NOTICE, "cand %s => fd=%d errno=%d", p, fd, errno);
         if (fd >= 0) {
             g_logfd = fd;
             strncpy(g_logpath, p, sizeof(g_logpath)-1);
@@ -91,19 +116,7 @@ static void ihp_open_log(void) {
         }
         g_open_errno = errno;
     }
-    /* 最后兜底：TMPDIR（沙盒容器私有临时目录），v1.0.1/1.0.2 陷阱是把它当首选 */
-    const char *tmp = getenv("TMPDIR");
-    if (tmp && *tmp) {
-        char p[256];
-        int n = snprintf(p, sizeof(p), "%s/%s", tmp, name);
-        if (n > 0 && n < (int)sizeof(p)) {
-            int fd = open(p, O_WRONLY | O_APPEND | O_CREAT, 0644);
-            if (fd >= 0) {
-                g_logfd = fd;
-                strncpy(g_logpath, p, sizeof(g_logpath)-1);
-            }
-        }
-    }
+    syslog(LOG_NOTICE, "ALL CANDIDATES FAILED pid=%d", (int)getpid());
 }
 
 /* 向 ctor 已持有的 fd 追加（无反复 open，开销低） */
@@ -252,8 +265,11 @@ static void *ihp_sampler(void *arg) {
 }
 
 __attribute__((constructor)) static void ihp_init(void) {
-    if (access(IHP_DISABLE_FLAG, F_OK) == 0) return;
-    /* 多候选锁定日志路径（ctor 里 open 一次，取首个成功 fd） */
+    openlog("IHP", LOG_PID, LOG_SYSLOG);
+    syslog(LOG_NOTICE, "INIT ctor entered pid=%d", (int)getpid());
+    /* v1.0.1: 去掉 /rootfs/private 头的 disable flag 检查 —— 沙盒进程看不到
+     * /rootfs 前缀，该 access 在本进程视图恒失败但语义错误；诊断期无条件启动。
+     * 多候选锁定日志路径（ctor 里 open 一次，取首个成功 fd） */
     ihp_open_log();
     pthread_t t;
     pthread_attr_t attr;

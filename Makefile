@@ -1,4 +1,5 @@
-# IntentsHelperProbe v1.0.0 - process-internal CPU spike stack sampler
+# IntentsHelperProbe v1.0.1 - process-internal CPU spike stack sampler
+#   v1.0.1: TMPDIR-first logging + syslog diagnostics to locate sandbox-writable path
 #   for intents_helper.xpc (roothide, arm64e, diagnostic tool).
 # Pure constructor: no substrate/ellekit/Foundation/UIKit link, so a launchd
 # XPC service can dlopen it without the silent-failure risk of heavy frameworks.
