@@ -71,7 +71,9 @@ static int      g_open_errno = 0;
 #define IHP_INTERVAL_US   100000   /* 100ms 采样间隔 */
 #define IHP_SPIKE_PCT     50       /* 进程总 CPU > 50% 单核判尖峰 */
 #define IHP_COOLDOWN_S    2        /* 同进程两次 dump 最小间隔(秒) */
-#define IHP_MAX_DUMPS     500      /* 日志上限，防止长期挂无限增长 */
+#define IHP_MAX_DUMPS     500      /* 尖峰 dump 上限，防止长期挂无限增长 */
+#define IHP_SNAP_INTERVAL 5000000  /* v1.1.0: 定时快照 5s(us)，覆盖低 CPU 的 XPC 回调 */
+#define IHP_MAX_SNAPS     300      /* 快照上限(25 分钟)，防止日志无限增长 */
 #define IHP_FP_DEPTH      16
 #define IHP_FRAME_BYTES   16       /* arm64 frame record = {fp, lr} = 16B */
 
@@ -135,6 +137,48 @@ static uint64_t proc_cpu_us(thread_array_t *out_threads, mach_msg_type_number_t 
     return total;
 }
 
+/* ---------- v1.1.0: 从进程地址空间读 C 字符串（syscall 路径参数） ----------
+ * stat/getattrlist/open 等 wrapper 的第一个参数(x0)指向路径字符串。
+ * 尖峰/快照时刻用 vm_read_overwrite 分块读出，最多 cap 字节。失败则留空。 */
+static void ihp_read_cstr(uint64_t addr, char *out, size_t cap) {
+    out[0] = '\0';
+    if (!addr || cap < 2) return;
+    size_t used = 0;
+    uint64_t cur = addr;
+    while (used + 1 < cap) {
+        char chunk[32];
+        vm_size_t got = 0;
+        kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                              (vm_address_t)cur, sizeof(chunk),
+                              (vm_address_t)chunk, &got);
+        if (kr != KERN_SUCCESS || got == 0) break;
+        for (vm_size_t i = 0; i < got && used + 1 < cap; i++) {
+            out[used++] = chunk[i];
+            if (chunk[i] == '\0') { out[used-1] = '\0'; return; }
+        }
+        cur += got;
+    }
+    out[used < cap ? used : cap-1] = '\0';
+}
+
+/* v1.1.0: 判断 PC 落在哪个「带路径参数」的 syscall wrapper 上，返回路径寄存器说明。
+ * 匹配 libsystem_kernel 的 stat/lstat/fstatat/getattrlist/open/access 等。 */
+static const char *ihp_path_syscall(uint64_t pc) {
+    Dl_info si;
+    memset(&si, 0, sizeof(si));
+    if (!dladdr((void *)(uintptr_t)pc, &si) || !si.dli_sname) return NULL;
+    const char *sn = si.dli_sname;
+    static const char *names[] = {
+        "stat", "stat64", "lstat", "fstatat", "getattrlist", "__getattrlist",
+        "open", "open_nocancel", "access", "readlink", "realpath", NULL
+    };
+    for (int i = 0; names[i]; i++) {
+        size_t n = strlen(names[i]);
+        if (!strncmp(sn, names[i], n)) return names[i];
+    }
+    return NULL;
+}
+
 /* ---------- 符号化单个 PC，写一行 ---------- */
 static void ihp_frame(int idx, uint64_t pc) {
     if (pc == 0) return;
@@ -174,6 +218,15 @@ static void ihp_dump_thread(mach_port_t th, int tidx) {
 
     ihp_line(" T%d:", tidx);
     ihp_frame(0, pc);
+    /* v1.1.0: 栈顶正好在 stat/getattrlist 等 wrapper 内 => x0 是路径指针。
+     * 只有在 syscall 入口附近(x0 尚未被覆盖)才读，读出来直接打印。 */
+    const char *sc = ihp_path_syscall(pc);
+    if (sc) {
+        uint64_t x0 = (uint64_t)arm_thread_state64_get_x(st, 0);
+        char path[512];
+        ihp_read_cstr(x0, path, sizeof(path));
+        if (path[0]) ihp_line("    >> %s(\"%s\")", sc, path);
+    }
     if (lr && lr != pc) ihp_frame(1, (uint64_t)ptrauth_strip((void *)(uintptr_t)lr, ptrauth_key_asia));
 
     int depth = 2;
@@ -197,14 +250,14 @@ static void ihp_dump_thread(mach_port_t th, int tidx) {
 static void *ihp_sampler(void *arg) {
     (void)arg;
     uint64_t prev_cpu = 0, prev_wall = now_us();
-    uint64_t last_dump = 0;
-    int dumps = 0;
+    uint64_t last_dump = 0, last_snap = now_us();
+    int dumps = 0, snaps = 0;
 
-    ihp_line("BOOT pid=%d interval=%dus spike>=%d%% cooldown=%ds depth=%d log=%s errno=%d",
+    ihp_line("BOOT v1.1.0 pid=%d interval=%dus spike>=%d%% cooldown=%ds snap=%dus depth=%d log=%s errno=%d",
              (int)getpid(), IHP_INTERVAL_US, IHP_SPIKE_PCT, IHP_COOLDOWN_S,
-             IHP_FP_DEPTH, g_logpath, g_open_errno);
+             IHP_SNAP_INTERVAL, IHP_FP_DEPTH, g_logpath, g_open_errno);
 
-    while (dumps < IHP_MAX_DUMPS) {
+    while (dumps < IHP_MAX_DUMPS && snaps < IHP_MAX_SNAPS) {
         usleep(IHP_INTERVAL_US);
         uint64_t wall = now_us();
 
@@ -215,18 +268,23 @@ static void *ihp_sampler(void *arg) {
         uint64_t dcpu = (cpu >= prev_cpu) ? (cpu - prev_cpu) : 0;
         int pct = dwall ? (int)((dcpu * 100ULL) / dwall) : 0;
 
-        if (pct >= IHP_SPIKE_PCT && (wall - last_dump) >= (uint64_t)IHP_COOLDOWN_S * 1000000ULL) {
-            last_dump = wall;
-            dumps++;
-            ihp_line("=== SPIKE #%d %llu.%03llu cpu=%d%% threads=%u ===",
-                     dumps,
+        int do_spike = (pct >= IHP_SPIKE_PCT &&
+                        (wall - last_dump) >= (uint64_t)IHP_COOLDOWN_S * 1000000ULL &&
+                        dumps < IHP_MAX_DUMPS);
+        int do_snap = ((wall - last_snap) >= IHP_SNAP_INTERVAL && snaps < IHP_MAX_SNAPS);
+        if (do_spike || do_snap) {
+            const char *kind = do_spike ? "SPIKE" : "SNAP";
+            int seq = do_spike ? ++dumps : ++snaps;
+            if (do_spike) last_dump = wall; else last_snap = wall;
+            ihp_line("=== %s #%d %llu.%03llu cpu=%d%% threads=%u ===",
+                     kind, seq,
                      (unsigned long long)(wall / 1000000ULL),
                      (unsigned long long)((wall / 1000ULL) % 1000ULL),
                      pct, (unsigned)count);
             for (mach_msg_type_number_t i = 0; i < count; i++) {
                 ihp_dump_thread(threads[i], (int)i);
             }
-            ihp_line("=== END #%d ===", dumps);
+            ihp_line("=== END %s #%d ===", kind, seq);
         }
 
         if (threads) vm_deallocate(mach_task_self(), (vm_address_t)threads,
@@ -234,7 +292,7 @@ static void *ihp_sampler(void *arg) {
         prev_cpu = cpu;
         prev_wall = wall;
     }
-    ihp_line("STOP max-dumps=%d reached", IHP_MAX_DUMPS);
+    ihp_line("STOP dumps=%d snaps=%d reached", dumps, snaps);
     return NULL;
 }
 
@@ -244,7 +302,7 @@ static void *ihp_sampler(void *arg) {
  * ih_probe_*.log => ctor 执行了但 open_log 的多候选全失败;若 boot 文件也
  * 没有 => constructor 根本没被 dyld 执行(注入层问题)。一锤定音。 */
 __attribute__((constructor(100))) static void ihp_boot_proof(void) {
-    static const char boot[] = "BOOT ctor-executed build=1.0.3\n";
+    static const char boot[] = "BOOT ctor-executed build=1.1.0\n";
     char p0[256], p2[256];
     snprintf(p0, sizeof(p0), "/var/mobile/Library/Intents/ih_probe_boot_%d.log", (int)getpid());
     snprintf(p2, sizeof(p2), "/var/tmp/ih_probe_boot_%d.log", (int)getpid());

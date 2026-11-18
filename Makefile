@@ -1,4 +1,6 @@
-# IntentsHelperProbe v1.0.3 - process-internal CPU spike stack sampler
+# IntentsHelperProbe v1.1.0 - process-internal CPU spike stack sampler + syscall path capture
+#   v1.1.0: read x0 path at stat/getattrlist syscall entry + 5s periodic snapshots to catch
+#           low-CPU XPC callbacks (App launch). Answer: what exactly is being scanned/blocked.
 #   v1.0.3: mirror SearchPartyQuiet v1.0.4 EXACT log method: process-owned dir
 #           /var/mobile/Library/Intents first, /var/tmp second, NO getenv/TMPDIR/syslog
 #   v1.0.2: constructor(100) boot-proof to prove ctor execution && locate writable path
