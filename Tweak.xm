@@ -20,8 +20,10 @@
  * arm64e PAC：thread_get_state 返回的 PC/LR/FP 由内核 strip 过；FP 链里
  * 的 LR 是签名值，读取后统一 ptrauth_strip 再 dladdr，避免符号化落到垃圾地址。
  *
- * 日志：/rootfs/private/var/tmp/ih_probe.log （roothide 下进程内可写，
- * 与 CacheDeleteQuiet.log 同一已验证范式；root SSH 用 /rootfs/private 头读）。
+ * 日志：ctor 里多候选 open 取首个成功 fd（与 CacheDeleteQuiet/SearchPartyQuiet
+ * 完全同一已验证范式）：/var/mobile/Library/Logs/ → /var/tmp/ → /private/var/tmp/
+ * → /var/mobile/Documents/ → $TMPDIR，文件名 ih_probe_<pid>.log。BOOT 行会打印
+ * 实际锁定路径。root SSH 读取时统一加 /rootfs/private 头。
  *
  * flag：/rootfs/private/var/tmp/ih_probe.disabled 存在则 constructor 直接返回，
  *       用于老板不需要时一键停采（无需卸载 deb）。
@@ -43,9 +45,24 @@
 #include <string.h>
 #include <errno.h>
 
-/* 每实例独立日志：intents_helper 是多实例 XPC，共写一个文件会交错不可读 */
-static char IHP_LOG[128] = "/rootfs/private/var/tmp/ih_probe.log";
+/* 每实例独立日志：intents_helper 是多实例 XPC，共写一个文件会交错不可读。
+ * 落盘范式照抄已验证的 CacheDeleteQuiet/SearchPartyQuiet：ctor 里多候选
+ * open 一次、持有全局 fd，首个成功者锁定路径。单硬编码路径必然静默失败
+ * （沙盒守护进程视图与 SSH 不同，/var/tmp 曾踩坑）。 */
 #define IHP_DISABLE_FLAG "/rootfs/private/var/tmp/ih_probe.disabled"
+
+/* 候选目录：进程自有容器优先，再通用 tmp。无需 mkdir 父目录（都已存在）。
+ * SSH 读取时统一加 /rootfs/private 头（进程视图里写的是无头 /var/...）。 */
+static const char *IHP_LOG_DIRS[] = {
+    "/var/mobile/Library/Logs",
+    "/var/tmp",
+    "/private/var/tmp",
+    "/var/mobile/Documents",
+};
+
+static int      g_logfd = -1;
+static char     g_logpath[256] = "(none)";
+static int      g_open_errno = 0;
 
 #define IHP_INTERVAL_US   100000   /* 100ms 采样间隔 */
 #define IHP_SPIKE_PCT     50       /* 进程总 CPU > 50% 单核判尖峰 */
@@ -54,12 +71,41 @@ static char IHP_LOG[128] = "/rootfs/private/var/tmp/ih_probe.log";
 #define IHP_FP_DEPTH      16
 #define IHP_FRAME_BYTES   16       /* arm64 frame record = {fp, lr} = 16B */
 
-/* ---------- 异步安全的文件追加 ---------- */
+/* ctor 调用：多候选取首个成功 fd（与 CacheDeleteQuiet open_log 同法） */
+static void ihp_open_log(void) {
+    char name[96];
+    snprintf(name, sizeof(name), "ih_probe_%d.log", (int)getpid());
+    for (size_t i = 0; i < sizeof(IHP_LOG_DIRS)/sizeof(IHP_LOG_DIRS[0]); i++) {
+        char p[256];
+        int n = snprintf(p, sizeof(p), "%s/%s", IHP_LOG_DIRS[i], name);
+        if (n <= 0 || n >= (int)sizeof(p)) continue;
+        int fd = open(p, O_WRONLY | O_APPEND | O_CREAT, 0644);
+        if (fd >= 0) {
+            g_logfd = fd;
+            strncpy(g_logpath, p, sizeof(g_logpath)-1);
+            return;
+        }
+        g_open_errno = errno;
+    }
+    /* 最后兜底：TMPDIR（沙盒容器私有临时目录），v1.0.1/1.0.2 陷阱是把它当首选 */
+    const char *tmp = getenv("TMPDIR");
+    if (tmp && *tmp) {
+        char p[256];
+        int n = snprintf(p, sizeof(p), "%s/%s", tmp, name);
+        if (n > 0 && n < (int)sizeof(p)) {
+            int fd = open(p, O_WRONLY | O_APPEND | O_CREAT, 0644);
+            if (fd >= 0) {
+                g_logfd = fd;
+                strncpy(g_logpath, p, sizeof(g_logpath)-1);
+            }
+        }
+    }
+}
+
+/* 向 ctor 已持有的 fd 追加（无反复 open，开销低） */
 static void ihp_append(const char *buf, size_t len) {
-    int fd = open(IHP_LOG, O_WRONLY | O_APPEND | O_CREAT, 0644);
-    if (fd < 0) return;
-    (void)!write(fd, buf, len);
-    close(fd);
+    if (g_logfd < 0) return;
+    (void)!write(g_logfd, buf, len);
 }
 static void ihp_line(const char *fmt, ...) {
     char b[1024];
@@ -163,8 +209,9 @@ static void *ihp_sampler(void *arg) {
     uint64_t last_dump = 0;
     int dumps = 0;
 
-    ihp_line("BOOT pid=%d interval=%dus spike>=%d%% cooldown=%ds depth=%d",
-             (int)getpid(), IHP_INTERVAL_US, IHP_SPIKE_PCT, IHP_COOLDOWN_S, IHP_FP_DEPTH);
+    ihp_line("BOOT pid=%d interval=%dus spike>=%d%% cooldown=%ds depth=%d log=%s errno=%d",
+             (int)getpid(), IHP_INTERVAL_US, IHP_SPIKE_PCT, IHP_COOLDOWN_S,
+             IHP_FP_DEPTH, g_logpath, g_open_errno);
 
     while (dumps < IHP_MAX_DUMPS) {
         usleep(IHP_INTERVAL_US);
@@ -202,9 +249,8 @@ static void *ihp_sampler(void *arg) {
 
 __attribute__((constructor)) static void ihp_init(void) {
     if (access(IHP_DISABLE_FLAG, F_OK) == 0) return;
-    /* 构造实例独立日志路径：ih_probe_<pid>.log */
-    snprintf(IHP_LOG, sizeof(IHP_LOG),
-             "/rootfs/private/var/tmp/ih_probe_%d.log", (int)getpid());
+    /* 多候选锁定日志路径（ctor 里 open 一次，取首个成功 fd） */
+    ihp_open_log();
     pthread_t t;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
