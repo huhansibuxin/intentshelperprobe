@@ -46,6 +46,7 @@
 #include <string.h>
 #include <errno.h>
 #include <syslog.h>
+#include <sys/stat.h>
 
 /* 每实例独立日志：intents_helper 是多实例 XPC，共写一个文件会交错不可读。
  * 落盘范式照抄已验证的 CacheDeleteQuiet/SearchPartyQuiet：ctor 里多候选
@@ -262,6 +263,46 @@ static void *ihp_sampler(void *arg) {
     }
     ihp_line("STOP max-dumps=%d reached", IHP_MAX_DUMPS);
     return NULL;
+}
+
+/* ---- boot proof (v1.0.2, 照抄 SearchPartyQuiet v1.0.3 已验证范式) --------
+ * priority=100 先于默认 ctor 执行。只用 open()+预置常量,不用 syslog/getenv/
+ * vsnprintf/flag/early-return。若装机后能找到 ih_probe_boot_*.log 但没有
+ * ih_probe_*.log => ctor 执行了但 open_log 的多候选全失败;若 boot 文件也
+ * 没有 => constructor 根本没被 dyld 执行(注入层问题)。一锤定音。 */
+__attribute__((constructor(100))) static void ihp_boot_proof(void) {
+    static const char *dirs[] = {
+        "/var/tmp",
+        "/private/var/tmp",
+        "/var/mobile/Documents",
+        "/tmp",
+        "/var/mobile/Library/com.apple.icloud.searchpartyd",
+        NULL
+    };
+    static const char boot[] =
+        "BOOT ctor-executed build=1.0.2 "
+        "(if you see this but no ih_probe_<pid>.log, open_log() failed)\n";
+    char p[256];
+    for (int i = 0; dirs[i]; i++) {
+        (void)mkdir(dirs[i], 0755);   /* 忽略 EEXIST / 权限失败 */
+        int n = snprintf(p, sizeof(p), "%s/ih_probe_boot_%d.log", dirs[i], (int)getpid());
+        if (n <= 0 || n >= (int)sizeof(p)) continue;
+        int fd = open(p, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            (void)write(fd, boot, sizeof(boot) - 1);
+            close(fd);
+            return;   /* 只写一个,找到即可 */
+        }
+    }
+    /* 最后兜底: TMPDIR 原值 */
+    const char *tmp = getenv("TMPDIR");
+    if (tmp && *tmp) {
+        int n = snprintf(p, sizeof(p), "%s/ih_probe_boot_%d.log", tmp, (int)getpid());
+        if (n > 0 && n < (int)sizeof(p)) {
+            int fd = open(p, O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (fd >= 0) { (void)write(fd, boot, sizeof(boot) - 1); close(fd); }
+        }
+    }
 }
 
 __attribute__((constructor)) static void ihp_init(void) {
