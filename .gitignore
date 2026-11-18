@@ -1,0 +1,4 @@
+dist/
+.theos/
+packages/
+*.deb
