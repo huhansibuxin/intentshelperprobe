@@ -49,22 +49,20 @@
 #include <sys/stat.h>
 
 /* 每实例独立日志：intents_helper 是多实例 XPC，共写一个文件会交错不可读。
- * 落盘范式照抄已验证的 CacheDeleteQuiet/SearchPartyQuiet：ctor 里多候选
- * open 一次、持有全局 fd，首个成功者锁定路径。单硬编码路径必然静默失败
- * （沙盒守护进程视图与 SSH 不同，/var/tmp 曾踩坑）。 */
+ *
+ * v1.0.3 —— 完全照抄 SearchPartyQuiet v1.0.4(已在真机写出 BOOT+日志的范式):
+ *   mkdir(进程自有数据目录,0755) 然后 open(O_WRONLY|O_CREAT|O_APPEND,0644)。
+ *   进程自有目录 FIRST(/var/mobile/Library/Intents, mobile:mobile, 进程每天
+ *   在写其中的 Images/), /var/tmp SECOND。绝不用 getenv/TMPDIR —— SPQ 源码
+ *   注释原话: "NO TMPDIR/getenv - that was the v1.0.1/1.0.2 trap (view mismatch)"。
+ *   v1.0.0~1.0.2 四版零日志的根因就是 TMPDIR 视图错配 + 候选目录都不是进程自有。 */
 #define IHP_DISABLE_FLAG "/rootfs/private/var/tmp/ih_probe.disabled"
 
-/* 候选目录：按「mobile 身份注入进程可写」排序，已实测 mobile 对 /var/tmp、
- * /private/var/tmp、Documents 可写，对 /var/mobile/Library/Logs 不可写(属
- * _analyticsusers)。注入进程写无头 /var/...，SSH 用 /rootfs/private 头读到
- * 同一处 —— 由 SearchPartyQuiet.log(注入 searchpartyd)实测印证。
- * /var/tmp 置首：CacheDeleteQuiet 实测的就是这个落点。 */
-static const char *IHP_LOG_DIRS[] = {
-    "/var/tmp",
-    "/private/var/tmp",
-    "/var/mobile/Documents",
-    "/var/mobile/Library/Logs",
-};
+/* SPQ 铁证: constructor 在此类 XPC/daemon 确实执行(BOOT ctor-executed 在日志第一行)。
+ * 关键只在于写进「进程自己的数据目录」—— SSH 加 /rootfs/private 头读到同一处。 */
+#define IHP_LOG_DIR0 "/var/mobile/Library/Intents"
+#define IHP_LOG_PATH0 IHP_LOG_DIR0 "/ih_probe_%d.log"
+#define IHP_LOG_PATH2 "/var/tmp/ih_probe_%d.log"
 
 static int      g_logfd = -1;
 static char     g_logpath[256] = "(none)";
@@ -77,47 +75,22 @@ static int      g_open_errno = 0;
 #define IHP_FP_DEPTH      16
 #define IHP_FRAME_BYTES   16       /* arm64 frame record = {fp, lr} = 16B */
 
-/* ctor 调用：多候选取首个成功 fd（与 CacheDeleteQuiet open_log 同法）。
- * v1.0.1: TMPDIR 提到首位 —— intents_helper 是沙盒 XPC，/var/tmp 被沙盒
- * 重定向，只有 TMPDIR 是沙盒保证可写处。每个候选成败走 syslog（沙盒可用），
- * 一次安装即可从 syslog 看清 ctor 是否执行、哪个路径成功。 */
+/* v1.0.3: byte-for-byte the SearchPartyQuiet v1.0.4 method - mkdir(dir,0755)
+ * then open(O_WRONLY|O_CREAT|O_APPEND,0644). Process-owned data dir FIRST,
+ * /var/tmp second. NO getenv/TMPDIR (that was the trap). */
 static void ihp_open_log(void) {
-    char name[96];
-    snprintf(name, sizeof(name), "ih_probe_%d.log", (int)getpid());
-    openlog("IHP", LOG_PID, LOG_SYSLOG);
-    syslog(LOG_NOTICE, "ctor pid=%d starting, TMPDIR=%s",
-           (int)getpid(), getenv("TMPDIR") ? getenv("TMPDIR") : "(null)");
+    char p0[256], p2[256];
+    snprintf(p0, sizeof(p0), IHP_LOG_PATH0, (int)getpid());
+    snprintf(p2, sizeof(p2), IHP_LOG_PATH2, (int)getpid());
 
-    /* 首位：TMPDIR（沙盒私有临时目录，唯一保证可写） */
-    const char *tmp = getenv("TMPDIR");
-    if (tmp && *tmp) {
-        char p[512];
-        int n = snprintf(p, sizeof(p), "%s/%s", tmp, name);
-        if (n > 0 && n < (int)sizeof(p)) {
-            int fd = open(p, O_WRONLY | O_APPEND | O_CREAT, 0644);
-            syslog(LOG_NOTICE, "cand TMPDIR %s => fd=%d errno=%d", p, fd, errno);
-            if (fd >= 0) {
-                g_logfd = fd;
-                strncpy(g_logpath, p, sizeof(g_logpath)-1);
-                return;
-            }
-        }
-    }
-    /* 其余候选 */
-    for (size_t i = 0; i < sizeof(IHP_LOG_DIRS)/sizeof(IHP_LOG_DIRS[0]); i++) {
-        char p[256];
-        int n = snprintf(p, sizeof(p), "%s/%s", IHP_LOG_DIRS[i], name);
-        if (n <= 0 || n >= (int)sizeof(p)) continue;
-        int fd = open(p, O_WRONLY | O_APPEND | O_CREAT, 0644);
-        syslog(LOG_NOTICE, "cand %s => fd=%d errno=%d", p, fd, errno);
-        if (fd >= 0) {
-            g_logfd = fd;
-            strncpy(g_logpath, p, sizeof(g_logpath)-1);
-            return;
-        }
-        g_open_errno = errno;
-    }
-    syslog(LOG_NOTICE, "ALL CANDIDATES FAILED pid=%d", (int)getpid());
+    (void)mkdir(IHP_LOG_DIR0, 0755);
+    int fd = open(p0, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) { g_logfd = fd; strncpy(g_logpath, p0, sizeof(g_logpath)-1); return; }
+    g_open_errno = errno;
+
+    fd = open(p2, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) { g_logfd = fd; strncpy(g_logpath, p2, sizeof(g_logpath)-1); return; }
+    g_open_errno = errno;
 }
 
 /* 向 ctor 已持有的 fd 追加（无反复 open，开销低） */
@@ -271,46 +244,21 @@ static void *ihp_sampler(void *arg) {
  * ih_probe_*.log => ctor 执行了但 open_log 的多候选全失败;若 boot 文件也
  * 没有 => constructor 根本没被 dyld 执行(注入层问题)。一锤定音。 */
 __attribute__((constructor(100))) static void ihp_boot_proof(void) {
-    static const char *dirs[] = {
-        "/var/tmp",
-        "/private/var/tmp",
-        "/var/mobile/Documents",
-        "/tmp",
-        "/var/mobile/Library/com.apple.icloud.searchpartyd",
-        NULL
-    };
-    static const char boot[] =
-        "BOOT ctor-executed build=1.0.2 "
-        "(if you see this but no ih_probe_<pid>.log, open_log() failed)\n";
-    char p[256];
-    for (int i = 0; dirs[i]; i++) {
-        (void)mkdir(dirs[i], 0755);   /* 忽略 EEXIST / 权限失败 */
-        int n = snprintf(p, sizeof(p), "%s/ih_probe_boot_%d.log", dirs[i], (int)getpid());
-        if (n <= 0 || n >= (int)sizeof(p)) continue;
-        int fd = open(p, O_WRONLY | O_CREAT | O_APPEND, 0644);
-        if (fd >= 0) {
-            (void)write(fd, boot, sizeof(boot) - 1);
-            close(fd);
-            return;   /* 只写一个,找到即可 */
-        }
-    }
-    /* 最后兜底: TMPDIR 原值 */
-    const char *tmp = getenv("TMPDIR");
-    if (tmp && *tmp) {
-        int n = snprintf(p, sizeof(p), "%s/ih_probe_boot_%d.log", tmp, (int)getpid());
-        if (n > 0 && n < (int)sizeof(p)) {
-            int fd = open(p, O_WRONLY | O_CREAT | O_APPEND, 0644);
-            if (fd >= 0) { (void)write(fd, boot, sizeof(boot) - 1); close(fd); }
-        }
-    }
+    static const char boot[] = "BOOT ctor-executed build=1.0.3\n";
+    char p0[256], p2[256];
+    snprintf(p0, sizeof(p0), "/var/mobile/Library/Intents/ih_probe_boot_%d.log", (int)getpid());
+    snprintf(p2, sizeof(p2), "/var/tmp/ih_probe_boot_%d.log", (int)getpid());
+    (void)mkdir("/var/mobile/Library/Intents", 0755);
+    int fd = open(p0, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) fd = open(p2, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    (void)write(fd, boot, sizeof(boot) - 1);
+    close(fd);
 }
 
 __attribute__((constructor)) static void ihp_init(void) {
-    openlog("IHP", LOG_PID, LOG_SYSLOG);
-    syslog(LOG_NOTICE, "INIT ctor entered pid=%d", (int)getpid());
-    /* v1.0.1: 去掉 /rootfs/private 头的 disable flag 检查 —— 沙盒进程看不到
-     * /rootfs 前缀，该 access 在本进程视图恒失败但语义错误；诊断期无条件启动。
-     * 多候选锁定日志路径（ctor 里 open 一次，取首个成功 fd） */
+    /* v1.0.3: 去掉 syslog（SPQ 完全不用；设备上也没 log 命令读不到）。
+     * 完全照抄 SPQ: open_log 直接写进程自有目录,BOOT proof 已在 ctor(100) 写。 */
     ihp_open_log();
     pthread_t t;
     pthread_attr_t attr;
