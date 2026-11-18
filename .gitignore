@@ -2,3 +2,4 @@ dist/
 .theos/
 packages/
 *.deb
+*.dylib
