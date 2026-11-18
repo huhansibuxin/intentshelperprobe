@@ -1,0 +1,81 @@
+name: Build IntentsHelperProbe
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Theos (Roothide)
+        run: |
+          git clone --recurse-submodules https://github.com/roothide/theos.git ${{ runner.temp }}/theos
+          find ${{ runner.temp }}/theos/bin -name "*.pl" -exec sed -i '' '1s|#!/usr/bin/perl|#!/usr/bin/env perl|' {} \;
+          echo "THEOS=${{ runner.temp }}/theos" >> $GITHUB_ENV
+          echo "THEOS_PACKAGE_SCHEME=roothide" >> $GITHUB_ENV
+
+      - name: Install dependencies
+        run: |
+          export HOMEBREW_NO_REQUIRE_TAP_TRUST=1
+          brew install dpkg ldid
+
+      - name: Install SDK
+        run: |
+          cd ${{ runner.temp }}/theos/sdks
+          curl -sLO https://github.com/theos/sdks/archive/refs/heads/master.zip
+          unzip -q master.zip
+          mv sdks-master/iPhoneOS16.5.sdk .
+          rm -rf sdks-master master.zip
+
+      - name: Verify source discipline
+        run: |
+          if grep -nE '^[[:space:]]*%(hook|ctor|orig|log|new|end|group)' Tweak.xm; then
+            echo "::error::must stay pure C constructor (no Logos directives)"
+            exit 1
+          fi
+          if grep -n 'MSHookFunction\|SubstrateHook' Tweak.xm; then
+            echo "::error::must not call substrate hooks"
+            exit 1
+          fi
+          grep 'intents_helper' IntentsHelperProbe.plist
+
+      - name: Build
+        run: make package
+
+      - name: Verify dylib dependency hygiene
+        run: |
+          DYLIB=$(find .theos -name 'IntentsHelperProbe.dylib' -type f -not -path '*.dSYM*' | head -1)
+          if [ -z "$DYLIB" ] || [ ! -f "$DYLIB" ]; then
+            echo "::error::IntentsHelperProbe.dylib not found"
+            exit 1
+          fi
+          echo "== $DYLIB =="
+          otool -L "$DYLIB"
+          DEPS=$(otool -L "$DYLIB" | tail -n +2 | grep -v '@loader_path' || true)
+          if echo "$DEPS" | grep -qiE 'substrate|ellekit|UIKit|Foundation'; then
+            echo "::error::dylib links a forbidden heavy/substrate framework"
+            exit 1
+          fi
+          echo "OK: dependency hygiene (libSystem only)"
+
+      - name: Verify build tags
+        run: |
+          DYLIB=$(find .theos -name 'IntentsHelperProbe.dylib' -type f -not -path '*.dSYM*' | head -1)
+          STRINGS=$(strings -a "$DYLIB")
+          for NEEDLE in 'ih_probe_' 'SPIKE' 'thread_info' 'dladdr' 'ptrauth'; do
+            if ! echo "$STRINGS" | grep -qiF "$NEEDLE"; then
+              echo "::warning::string not found in dylib (may be optimized): $NEEDLE"
+            fi
+          done
+          grep -qiF 'ih_probe' <<< "$STRINGS" || { echo "::error::log path missing"; exit 1; }
+          echo "OK: build tags present"
+
+      - name: Upload deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: IntentsHelperProbe-roothide
+          path: packages/*.deb

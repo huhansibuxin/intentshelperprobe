@@ -1,0 +1,9 @@
+Package: com.huhansibuxin.intentshelperprobe
+Name: IntentsHelperProbe
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: Diagnostic-only stack sampler injected into intents_helper.xpc to answer what code the 90%+ one-to-ten-second CPU spikes are actually executing. A detached pthread samples all Mach threads' user+system CPU time every 100ms via thread_info (the shell's ps -o time is broken and always reads 0:00.00 on this device). When process CPU exceeds 50% of one core, it captures each thread's PC/LR/frame-pointer chain with thread_get_state, strips arm64e PAC, resolves each frame in-process with dladdr to image name + offset + symbol where available, and appends to a per-PID log at /rootfs/private/var/tmp/ih_probe_<pid>.log. No function is hooked and no target behavior is changed. Touch /rootfs/private/var/tmp/ih_probe.disabled to stop all instances without uninstalling. Hard-capped at 500 dumps per process.
+Maintainer: huhansibuxin
+Author: huhansibuxin
+Section: Tweaks
+Depends: ellekit
