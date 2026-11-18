@@ -28,7 +28,6 @@
  */
 
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
 #include <mach/thread_info.h>
 #include <mach/thread_act.h>
 #include <mach/arm/thread_status.h>
@@ -144,10 +143,10 @@ static void ihp_dump_thread(mach_port_t th, int tidx) {
     uint64_t cur = (uint64_t)ptrauth_strip((void *)(uintptr_t)fp, ptrauth_key_asia);
     for (int i = 0; i < IHP_FP_DEPTH && cur && depth < IHP_FP_DEPTH; i++) {
         uint64_t words[2] = {0, 0};
-        mach_vm_size_t got = 0;
-        kern_return_t kr = mach_vm_read_overwrite(mach_task_self(),
-                              (mach_vm_address_t)cur, IHP_FRAME_BYTES,
-                              (mach_vm_address_t)words, &got);
+        vm_size_t got = 0;
+        kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                              (vm_address_t)cur, IHP_FRAME_BYTES,
+                              (vm_address_t)words, &got);
         if (kr != KERN_SUCCESS || got != IHP_FRAME_BYTES) break;
         uint64_t next = (uint64_t)ptrauth_strip((void *)(uintptr_t)words[0], ptrauth_key_asia);
         uint64_t ret  = (uint64_t)ptrauth_strip((void *)(uintptr_t)words[1], ptrauth_key_asia);
